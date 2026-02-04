@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Agents.AI.Workflows;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.TestHost;
@@ -426,6 +427,234 @@ public sealed class OpenAIResponsesAgentResolutionIntegrationTests : IAsyncDispo
         this._app = builder.Build();
 
         // Use the agent resolution variant - MapOpenAIResponses() without agent parameter
+        this._app.MapOpenAIResponses();
+
+        await this._app.StartAsync();
+
+        TestServer testServer = this._app.Services.GetRequiredService<IServer>() as TestServer
+            ?? throw new InvalidOperationException("TestServer not found");
+
+        return testServer.CreateClient();
+    }
+
+    /// <summary>
+    /// Helper executor that returns a fixed response for testing workflows.
+    /// </summary>
+    private sealed class FixedResponseExecutor(string id, string responseText) : Executor(id)
+    {
+        protected override RouteBuilder ConfigureRoutes(RouteBuilder routeBuilder) =>
+            routeBuilder.AddHandler<object>(
+                (msg, ctx) =>
+                {
+                    ctx.Publish(responseText);
+                    return Task.CompletedTask;
+                });
+    }
+
+    /// <summary>
+    /// Verifies that workflow resolution works when a Workflow is registered but not as an AIAgent.
+    /// This is the bug reported in dotnet/extensions#7185.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponse_WithWorkflowName_ResolvesWorkflowAsAgentAsync()
+    {
+        // Arrange
+        const string WorkflowName = "test-workflow";
+        const string ExpectedResponse = "Response from workflow";
+
+        this._httpClient = await this.CreateTestServerWithWorkflowAsync(WorkflowName, ExpectedResponse);
+
+        // Act - Use raw HTTP request with agent.name set to the workflow name
+        using StringContent requestContent = new(JsonSerializer.Serialize(new
+        {
+            agent = new { name = WorkflowName },
+            input = new[]
+            {
+                new { type = "message", role = "user", content = "Test message" }
+            }
+        }), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage httpResponse = await this._httpClient!.PostAsync(new Uri("/v1/responses", UriKind.Relative), requestContent);
+
+        // Assert
+        Assert.True(httpResponse.IsSuccessStatusCode, $"Request failed with status {httpResponse.StatusCode}");
+
+        string responseJson = await httpResponse.Content.ReadAsStringAsync();
+        using JsonDocument doc = JsonDocument.Parse(responseJson);
+        JsonElement root = doc.RootElement;
+
+        Assert.Equal("completed", root.GetProperty("status").GetString());
+        JsonElement outputArray = root.GetProperty("output");
+        Assert.True(outputArray.GetArrayLength() > 0);
+    }
+
+    /// <summary>
+    /// Verifies that workflow resolution works in streaming mode.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseStreaming_WithWorkflowName_ResolvesWorkflowAsAgentAsync()
+    {
+        // Arrange
+        const string WorkflowName = "streaming-workflow";
+        const string ExpectedResponse = "Streaming response from workflow";
+
+        this._httpClient = await this.CreateTestServerWithWorkflowAsync(WorkflowName, ExpectedResponse);
+
+        // Act - Use raw HTTP request with agent.name and streaming
+        using StringContent requestContent = new(JsonSerializer.Serialize(new
+        {
+            agent = new { name = WorkflowName },
+            stream = true,
+            input = new[]
+            {
+                new { type = "message", role = "user", content = "Test message" }
+            }
+        }), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage httpResponse = await this._httpClient!.PostAsync(new Uri("/v1/responses", UriKind.Relative), requestContent);
+
+        // Assert
+        Assert.True(httpResponse.IsSuccessStatusCode, $"Request failed with status {httpResponse.StatusCode}");
+
+        string responseText = await httpResponse.Content.ReadAsStringAsync();
+        Assert.Contains("response.created", responseText);
+        Assert.Contains("response.completed", responseText);
+    }
+
+    /// <summary>
+    /// Verifies that AIAgent resolution takes priority over Workflow resolution when both exist with the same name.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponse_WithBothAgentAndWorkflow_PrioritizesAgentAsync()
+    {
+        // Arrange
+        const string SharedName = "shared-name";
+        const string AgentResponse = "Response from AIAgent";
+        const string WorkflowResponse = "Response from Workflow";
+
+        this._httpClient = await this.CreateTestServerWithAgentAndWorkflowAsync(
+            SharedName, AgentResponse, WorkflowResponse);
+
+        // Act - Use raw HTTP request with agent.name
+        using StringContent requestContent = new(JsonSerializer.Serialize(new
+        {
+            agent = new { name = SharedName },
+            input = new[]
+            {
+                new { type = "message", role = "user", content = "Test message" }
+            }
+        }), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage httpResponse = await this._httpClient!.PostAsync(new Uri("/v1/responses", UriKind.Relative), requestContent);
+
+        // Assert - Should use the AIAgent, not the Workflow
+        Assert.True(httpResponse.IsSuccessStatusCode, $"Request failed with status {httpResponse.StatusCode}");
+
+        string responseJson = await httpResponse.Content.ReadAsStringAsync();
+        using JsonDocument doc = JsonDocument.Parse(responseJson);
+        JsonElement root = doc.RootElement;
+
+        Assert.Equal("completed", root.GetProperty("status").GetString());
+        JsonElement outputArray = root.GetProperty("output");
+        Assert.True(outputArray.GetArrayLength() > 0);
+
+        JsonElement firstOutput = outputArray[0];
+        JsonElement contentArray = firstOutput.GetProperty("content");
+        JsonElement firstContent = contentArray[0];
+        string actualResponse = firstContent.GetProperty("text").GetString() ?? string.Empty;
+
+        // Should use the AIAgent response, not the Workflow
+        Assert.Equal(AgentResponse, actualResponse);
+    }
+
+    /// <summary>
+    /// Verifies that workflow resolution works with metadata.entity_id.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponse_WithMetadataEntityId_ResolvesWorkflowAsync()
+    {
+        // Arrange
+        const string WorkflowName = "metadata-workflow";
+        const string ExpectedResponse = "Response via metadata";
+
+        this._httpClient = await this.CreateTestServerWithWorkflowAsync(WorkflowName, ExpectedResponse);
+
+        // Act - Use raw HTTP request with metadata.entity_id
+        using StringContent requestContent = new(JsonSerializer.Serialize(new
+        {
+            metadata = new { entity_id = WorkflowName },
+            input = new[]
+            {
+                new { type = "message", role = "user", content = "Test message" }
+            }
+        }), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage httpResponse = await this._httpClient!.PostAsync(new Uri("/v1/responses", UriKind.Relative), requestContent);
+
+        // Assert
+        Assert.True(httpResponse.IsSuccessStatusCode, $"Request failed with status {httpResponse.StatusCode}");
+
+        string responseJson = await httpResponse.Content.ReadAsStringAsync();
+        using JsonDocument doc = JsonDocument.Parse(responseJson);
+        JsonElement root = doc.RootElement;
+
+        Assert.Equal("completed", root.GetProperty("status").GetString());
+    }
+
+    private async Task<HttpClient> CreateTestServerWithWorkflowAsync(string workflowName, string responseText)
+    {
+        WebApplicationBuilder builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer();
+
+        // Create and register a workflow using AddWorkflow
+        builder.AddWorkflow(workflowName, (sp, name) =>
+        {
+            var executorId = $"executor-{name}";
+            return new WorkflowBuilder(executorId)
+                .WithName(name)
+                .WithDescription($"Test workflow: {name}")
+                .BindExecutor(new FixedResponseExecutor(executorId, responseText))
+                .Build();
+        });
+
+        builder.AddOpenAIResponses();
+
+        this._app = builder.Build();
+        this._app.MapOpenAIResponses();
+
+        await this._app.StartAsync();
+
+        TestServer testServer = this._app.Services.GetRequiredService<IServer>() as TestServer
+            ?? throw new InvalidOperationException("TestServer not found");
+
+        return testServer.CreateClient();
+    }
+
+    private async Task<HttpClient> CreateTestServerWithAgentAndWorkflowAsync(
+        string sharedName, string agentResponse, string workflowResponse)
+    {
+        WebApplicationBuilder builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer();
+
+        // Register an AIAgent with the shared name
+        IChatClient mockChatClient = new TestHelpers.SimpleMockChatClient(agentResponse);
+        builder.Services.AddKeyedSingleton($"chat-client-{sharedName}", mockChatClient);
+        builder.AddAIAgent(sharedName, "Test agent instructions", chatClientServiceKey: $"chat-client-{sharedName}");
+
+        // Also register a Workflow with the same name
+        builder.AddWorkflow(sharedName, (sp, name) =>
+        {
+            var executorId = $"executor-{name}";
+            return new WorkflowBuilder(executorId)
+                .WithName(name)
+                .WithDescription($"Test workflow: {name}")
+                .BindExecutor(new FixedResponseExecutor(executorId, workflowResponse))
+                .Build();
+        });
+
+        builder.AddOpenAIResponses();
+
+        this._app = builder.Build();
         this._app.MapOpenAIResponses();
 
         await this._app.StartAsync();

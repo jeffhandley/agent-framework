@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Agents.AI.Hosting.OpenAI.Responses.Models;
+using Microsoft.Agents.AI.Workflows;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -14,7 +15,8 @@ namespace Microsoft.Agents.AI.Hosting.OpenAI.Responses;
 
 /// <summary>
 /// Response executor that routes requests to hosted AIAgent services based on agent.name or metadata["entity_id"].
-/// This executor resolves agents from keyed services registered via AddAIAgent().
+/// This executor resolves agents from keyed services registered via AddAIAgent(). If no agent is found, it will
+/// also look for keyed Workflow services and wrap them as agents using <see cref="WorkflowHostingExtensions.AsAgent"/>.
 /// The model field is reserved for actual model names and is never used for entity/agent identification.
 /// </summary>
 internal sealed class HostedAgentResponseExecutor : IResponseExecutor
@@ -56,21 +58,21 @@ internal sealed class HostedAgentResponseExecutor : IResponseExecutor
         }
 
         // Validate that the agent can be resolved
-        AIAgent? agent = this._serviceProvider.GetKeyedService<AIAgent>(agentName);
+        AIAgent? agent = this.ResolveAgent(agentName);
         if (agent is null)
         {
             if (this._logger.IsEnabled(LogLevel.Warning))
             {
-                this._logger.LogWarning("Failed to resolve agent with name '{AgentName}'", agentName);
+                this._logger.LogWarning("Failed to resolve agent or workflow with name '{AgentName}'", agentName);
             }
 
             return ValueTask.FromResult<ResponseError?>(new ResponseError
             {
                 Code = "agent_not_found",
                 Message = $"""
-                    Agent '{agentName}' not found.
+                    Agent or workflow '{agentName}' not found.
                     Ensure the agent is registered with '{agentName}' name in the dependency injection container.
-                    We recommend using 'builder.AddAIAgent()' for simplicity.
+                    We recommend using 'builder.AddAIAgent()' or 'builder.AddWorkflow()' for simplicity.
                 """
             });
         }
@@ -85,7 +87,7 @@ internal sealed class HostedAgentResponseExecutor : IResponseExecutor
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         string agentName = GetAgentName(request)!;
-        AIAgent agent = this._serviceProvider.GetRequiredKeyedService<AIAgent>(agentName);
+        AIAgent agent = this.ResolveAgent(agentName) ?? throw new InvalidOperationException($"Agent '{agentName}' not found.");
 
         var chatOptions = new ChatOptions
         {
@@ -133,5 +135,29 @@ internal sealed class HostedAgentResponseExecutor : IResponseExecutor
         }
 
         return agentName;
+    }
+
+    /// <summary>
+    /// Resolves an agent by name, first looking for a registered AIAgent, then falling back to a Workflow.
+    /// </summary>
+    /// <param name="agentName">The name of the agent to resolve.</param>
+    /// <returns>The resolved AIAgent, or null if not found.</returns>
+    private AIAgent? ResolveAgent(string agentName)
+    {
+        // First, try to resolve as AIAgent
+        AIAgent? agent = this._serviceProvider.GetKeyedService<AIAgent>(agentName);
+        if (agent is not null)
+        {
+            return agent;
+        }
+
+        // Fall back to resolving as Workflow and wrapping as an agent
+        Workflow? workflow = this._serviceProvider.GetKeyedService<Workflow>(agentName);
+        if (workflow is not null)
+        {
+            return workflow.AsAgent(name: agentName);
+        }
+
+        return null;
     }
 }
